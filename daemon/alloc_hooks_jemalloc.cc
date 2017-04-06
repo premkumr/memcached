@@ -15,13 +15,13 @@
  *   limitations under the License.
  */
 #include "config.h"
+
 #include "alloc_hooks.h"
-#include <stdbool.h>
-
+#include "memcached/extension_loggers.h"
 #include "memcached/visibility.h"
-#include <memcached/extension_loggers.h>
-#include <platform/cb_malloc.h>
 
+#include <platform/cb_malloc.h>
+#include <platform/strerror.h>
 
 /* Irrespective of how jemalloc was configured on this platform,
 * don't rename je_FOO to FOO.
@@ -33,16 +33,89 @@
 #include <malloc.h>
 #endif
 
+#include <array>
+#include <stdbool.h>
+#include <cstring>
+
 /* jemalloc checks for this symbol, and it's contents for the config to use. */
 const char* je_malloc_conf =
     /* Use just one arena, instead of the default based on number of CPUs.
        Helps to minimize heap fragmentation. */
-    "narenas:1";
+    "narenas:1,tcache:false";
 
-static int jemalloc_get_stats_prop(const char* property, size_t* value) {
-    size_t size = sizeof(*value);
-    return je_mallctl(property, value, &size, NULL, 0);
+template<typename T>
+static int je_set(const char* property, T newValue) {
+    int err = je_mallctl(property, NULL, NULL, (void*)&newValue, sizeof(T));
+    if (err) {
+        get_stderr_logger()->log(EXTENSION_LOG_WARNING, NULL,
+                                 "je_set [%s] error %d - "
+                                 "prop:%s",cb_strerror(err).c_str(), err, property);
+    }
+    return err;
 }
+
+template<typename T>
+static T je_get(const char* property) {
+    T value;
+    size_t size = sizeof(value);
+    value = 0;
+    int err = je_mallctl(property, (void*)&value, &size, NULL, 0);
+    if (err) {
+        get_stderr_logger()->log(EXTENSION_LOG_WARNING, NULL,
+                                 "je_get [%s] error %d - "
+                                 "prop:%s",cb_strerror(err).c_str(), err, property);
+    }
+    return value;
+}
+
+/**
+ * Helper class to cache the mib infos for je_malloc
+ */
+class ArenaSizeHelper {
+    using AllocMibArray = std::array<size_t, 5>;
+public:
+    ArenaSizeHelper() {
+        size_t miblen = 0;
+
+        miblen = 5;
+        je_mallctlnametomib("stats.arenas.0.small.allocated",
+                            small_mib.begin(), &miblen);
+
+        miblen = 5;
+        je_mallctlnametomib("stats.arenas.0.large.allocated",
+                            large_mib.begin(), &miblen);
+
+        miblen = 5;
+        je_mallctlnametomib("stats.arenas.0.huge.allocated",
+                            huge_mib.begin(), &miblen);
+    }
+
+    size_t getSizeViaMib(const AllocMibArray& mibArray, size_t arenaid) {
+        AllocMibArray mib = mibArray;
+        mib[2] = arenaid;
+        size_t allocSize = 0;
+        size_t typeSize = sizeof(allocSize);
+
+        je_mallctlbymib(mib.begin(), 5, (void *)&allocSize, &typeSize, NULL, 0);
+        return allocSize;
+    }
+
+    size_t getArenaSize(size_t arenaid) {
+        // refresh stats
+        size_t totalSize = 0;
+        je_set<uint64_t>("epoch", 1);
+
+        totalSize += getSizeViaMib(small_mib, arenaid);
+        totalSize += getSizeViaMib(large_mib, arenaid);
+        totalSize += getSizeViaMib(huge_mib, arenaid);
+
+        return totalSize;
+    }
+
+private:
+    AllocMibArray small_mib, large_mib, huge_mib;
+} arenaSizeHelper;
+
 
 struct write_state {
     char* buffer;
@@ -109,8 +182,8 @@ void JemallocHooks::get_allocator_stats(allocator_stats* stats) {
     /* jemalloc can cache its statistics - force a refresh */
     je_mallctl("epoch", &epoch, &sz, &epoch, sz);
 
-    jemalloc_get_stats_prop("stats.allocated", &(stats->allocated_size));
-    jemalloc_get_stats_prop("stats.mapped", &(stats->heap_size));
+    stats->allocated_size = je_get<size_t>("stats.allocated");
+    stats->heap_size = je_get<size_t>("stats.mapped");
 
     /* No explicit 'free' memory measurements for jemalloc; however: */
 
@@ -150,8 +223,7 @@ void JemallocHooks::get_allocator_stats(allocator_stats* stats) {
     /* 2. free_unmapped_size is approximately:
      * "mapped - active - stats.arenas.<i>.pdirty"
      */
-    size_t active_bytes;
-    jemalloc_get_stats_prop("stats.active", &active_bytes);
+    size_t active_bytes = je_get<size_t>("stats.active");
     stats->free_unmapped_size = stats->heap_size
                                 - active_bytes
                                 - stats->free_mapped_size;
@@ -233,11 +305,29 @@ bool JemallocHooks::enable_thread_cache(bool enable) {
     return old;
 }
 
-bool JemallocHooks::get_allocator_property(const char* name, size_t* value) {
-    return jemalloc_get_stats_prop(name, value);
+bool JemallocHooks::get_allocator_property(const char* name, void* value, size_t* size) {
+    /* jemalloc can cache its statistics - force a refresh */
+    je_set<uint64_t>("epoch", 1);
+    int err = je_mallctl(name, (void*)value, size, NULL, 0);
+    if (err) {
+        get_stderr_logger()->log(EXTENSION_LOG_WARNING, NULL,
+                                 "get_allocator_property [%s] error %d - "
+                                 "prop:%s",cb_strerror(err).c_str(), err, name);
+    }
+
+    return 0 == value;
 }
 
-bool JemallocHooks::set_allocator_property(const char* name, size_t value) {
-    /* Not yet implemented */
-    return 0;
+bool JemallocHooks::set_allocator_property(const char* name, void *value, size_t sz) {
+    int err = je_mallctl(name, NULL, NULL, value, sz);
+    if (err) {
+        get_stderr_logger()->log(EXTENSION_LOG_WARNING, NULL,
+                                 "set_allocator_property [%s] error %d - "
+                                 "prop:%s",cb_strerror(err).c_str(), err, name);
+    }
+    return 0 == err;
+}
+
+size_t JemallocHooks::get_arena_allocation_size(size_t arenaid) {
+    return arenaSizeHelper.getArenaSize(arenaid);
 }
