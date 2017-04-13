@@ -88,6 +88,10 @@ public:
         miblen = 5;
         je_mallctlnametomib("stats.arenas.0.huge.allocated",
                             huge_mib.begin(), &miblen);
+
+        miblen = 2;
+        je_mallctlnametomib("thread.arena", arena_mib, &miblen);
+
     }
 
     size_t getSizeViaMib(const AllocMibArray& mibArray, size_t arenaid) {
@@ -98,6 +102,14 @@ public:
 
         je_mallctlbymib(mib.begin(), 5, (void *)&allocSize, &typeSize, NULL, 0);
         return allocSize;
+    }
+
+    int getCurrentArena(void* value, size_t* size) {
+        return je_mallctlbymib(arena_mib, 2, (void *)value, size, NULL, 0);
+    }
+
+    int setCurrentArena(void* value, size_t size) {
+        return je_mallctlbymib(arena_mib, 2, NULL, NULL, value, size);
     }
 
     size_t getArenaSize(size_t arenaid) {
@@ -114,6 +126,7 @@ public:
 
 private:
     AllocMibArray small_mib, large_mib, huge_mib;
+    size_t arena_mib[2];
 } arenaSizeHelper;
 
 
@@ -307,8 +320,15 @@ bool JemallocHooks::enable_thread_cache(bool enable) {
 
 bool JemallocHooks::get_allocator_property(const char* name, void* value, size_t* size) {
     /* jemalloc can cache its statistics - force a refresh */
-    je_set<uint64_t>("epoch", 1);
-    int err = je_mallctl(name, (void*)value, size, NULL, 0);
+    // je_set<uint64_t>("epoch", 1);
+    
+    int err;
+    if (name == NULL) {
+        // hack for thread.arena
+        err = arenaSizeHelper.getCurrentArena(value,size);
+    } else {
+        err = je_mallctl(name, (void*)value, size, NULL, 0);
+    }
     if (err) {
         get_stderr_logger()->log(EXTENSION_LOG_WARNING, NULL,
                                  "get_allocator_property [%s] error %d - "
@@ -319,7 +339,15 @@ bool JemallocHooks::get_allocator_property(const char* name, void* value, size_t
 }
 
 bool JemallocHooks::set_allocator_property(const char* name, void *value, size_t sz) {
-    int err = je_mallctl(name, NULL, NULL, value, sz);
+    int err;
+
+    if (name == NULL) {
+        // hack for thread.arena
+        err = arenaSizeHelper.setCurrentArena(value,sz);
+    } else {
+        err = je_mallctl(name, NULL, NULL, value, sz);
+    }
+    
     if (err) {
         get_stderr_logger()->log(EXTENSION_LOG_WARNING, NULL,
                                  "set_allocator_property [%s] error %d - "
